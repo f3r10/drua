@@ -165,14 +165,14 @@ struct SearchParams {
     /// searchable types. Workflows are git-synced but not indexed.
     #[serde(default)]
     types: Option<Vec<LibraryFileType>>,
-    /// Restrict to these space slugs. Each slug resolves to a
-    /// `space_id` via the spaces resolver; unknown slugs return
-    /// `InvalidArgument`. Omit / empty = no slug filter (all spaces
-    /// the subject can read). Project-scoped skills/notes are
-    /// excluded when this filter is set unless they live inside one
-    /// of the listed spaces.
-    #[serde(default)]
-    slugs: Option<Vec<String>>,
+    /// Restrict to these space slugs — the same value `space_slug`
+    /// carries on a hit. Each slug resolves to a `space_id` via the
+    /// spaces resolver; unknown slugs return `InvalidArgument`. Omit
+    /// / empty = no slug filter (all spaces the subject can read).
+    /// Project-scoped skills/notes are excluded when this filter is
+    /// set unless they live inside one of the listed spaces.
+    #[serde(default, alias = "slugs")]
+    space_slugs: Option<Vec<String>>,
     /// Path-prefix scope for `space_file` hits. Each entry restricts
     /// hits to files whose path equals it or lives under it as a
     /// subtree. Trailing slash optional. Empty / omitted = no path
@@ -333,8 +333,9 @@ impl LibraryToolSet {
                 "Cross-type, cross-project library search across skills, notes, \
                  and space files. Hybrid FTS + semantic similarity. Default \
                  is global — results span every project the subject can read. \
-                 Optional `slugs` (list of space slugs) narrows to those \
-                 spaces; unknown slugs return InvalidArgument. Optional \
+                 Optional `space_slugs` (list of space slugs, as returned \
+                 in each hit's `space_slug`) narrows to those spaces; \
+                 unknown slugs return InvalidArgument. Optional \
                  `paths` (list of subtree prefixes; reject leading `/`, \
                  `..`, globs) narrows `space_file` hits — ignored for \
                  skill / note rows. Returns ranked snippets; `space_file` \
@@ -363,11 +364,11 @@ impl LibraryToolSet {
         }
     }
 
-    async fn resolve_slugs(
+    async fn resolve_space_slugs(
         &self,
-        slugs: Option<Vec<String>>,
+        space_slugs: Option<Vec<String>>,
     ) -> Result<Vec<uuid::Uuid>, ToolSetsError> {
-        let Some(slugs) = slugs else {
+        let Some(slugs) = space_slugs else {
             return Ok(Vec::new());
         };
         let mut ids = Vec::with_capacity(slugs.len());
@@ -407,7 +408,7 @@ impl LibraryToolSet {
             vec![SKILL_DOC_TYPE, NOTE_DOC_TYPE, SPACE_DOC_TYPE]
         };
 
-        let scope_ids = self.resolve_slugs(params.slugs).await?;
+        let scope_ids = self.resolve_space_slugs(params.space_slugs).await?;
         let path_prefixes = SpacesTool::normalize_path_prefixes(params.paths.unwrap_or_default())?;
 
         let raw = self
@@ -627,26 +628,39 @@ mod tests {
         let params: SearchParams = serde_json::from_value(json).unwrap();
         assert_eq!(params.query, "auth flow");
         assert!(params.types.is_none());
-        assert!(params.slugs.is_none());
+        assert!(params.space_slugs.is_none());
         assert!(params.paths.is_none());
         assert_eq!(params.limit, DEFAULT_SEARCH_LIMIT);
     }
 
     #[test]
-    fn parse_search_with_slugs_and_paths() {
+    fn parse_search_with_space_slugs_and_paths() {
         let json = serde_json::json!({
             "query": "decision",
-            "slugs": ["drua-dev", "on-call"],
+            "space_slugs": ["drua-dev", "on-call"],
             "paths": ["decisions/", "research/"],
         });
         let params: SearchParams = serde_json::from_value(json).unwrap();
         assert_eq!(
-            params.slugs.as_deref(),
+            params.space_slugs.as_deref(),
             Some(&["drua-dev".to_string(), "on-call".to_string()][..])
         );
         assert_eq!(
             params.paths.as_deref(),
             Some(&["decisions/".to_string(), "research/".to_string()][..])
+        );
+    }
+
+    #[test]
+    fn parse_search_accepts_legacy_slugs_alias() {
+        let json = serde_json::json!({
+            "query": "decision",
+            "slugs": ["drua-dev"],
+        });
+        let params: SearchParams = serde_json::from_value(json).unwrap();
+        assert_eq!(
+            params.space_slugs.as_deref(),
+            Some(&["drua-dev".to_string()][..])
         );
     }
 
@@ -657,10 +671,10 @@ mod tests {
     }
 
     #[test]
-    fn search_input_schema_advertises_slugs_and_paths() {
+    fn search_input_schema_advertises_space_slugs_and_paths() {
         let schema = &*SEARCH_INPUT_SCHEMA;
         let s = schema.to_string();
-        assert!(s.contains("slugs"));
+        assert!(s.contains("space_slugs"));
         assert!(s.contains("paths"));
     }
 
