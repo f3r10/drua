@@ -1,6 +1,6 @@
 use rmcp::model::{CallToolResult, Content, RawContent};
 
-use drua_tool_caching::{ToolCaching, ToolCachingConfig, ToolCallOwnerId};
+use drua_tool_caching::{ToolCaching, ToolCachingConfig, ToolCallOwnerId, ToolOutputShape};
 
 const PG_CON: &str = "postgres://user:password@localhost:5432/drua";
 
@@ -32,6 +32,11 @@ async fn root_string_over_threshold_yields_envelope_with_recovery_section() {
     // all three regions present) wouldn't fire.
     let config = ToolCachingConfig {
         generic_threshold_bytes: 512,
+        // This test exercises the byte-mode envelope shape, not the
+        // min-hidden-bytes floor — disable it so a modest 1 KB payload
+        // still elides as before (see
+        // `sub_floor_payload_yields_no_envelope_and_no_persistence`).
+        min_hidden_bytes: 0,
         ..ToolCachingConfig::default()
     };
     let caching = ToolCaching::new(&pool().await, config);
@@ -47,6 +52,7 @@ async fn root_string_over_threshold_yields_envelope_with_recovery_section() {
             "bash",
             &serde_json::json!({}),
             upstream,
+            ToolOutputShape::Generic,
         )
         .await
         .expect("persistence is stubbed; this must not error");
@@ -169,6 +175,7 @@ async fn sub_threshold_input_is_passthrough_with_no_envelope() {
             "bash",
             &serde_json::json!({}),
             upstream,
+            ToolOutputShape::Generic,
         )
         .await
         .expect("persistence is stubbed; this must not error");
@@ -201,6 +208,9 @@ async fn sub_threshold_input_is_passthrough_with_no_envelope() {
 async fn persisted_invocation_round_trips_through_find_by_id() {
     let config = ToolCachingConfig {
         generic_threshold_bytes: 64,
+        // This test needs an actual persisted invocation to round-trip
+        // through find_by_id — disable the floor so the payload elides.
+        min_hidden_bytes: 0,
         ..ToolCachingConfig::default()
     };
     let caching = ToolCaching::new(&pool().await, config);
@@ -211,7 +221,13 @@ async fn persisted_invocation_round_trips_through_find_by_id() {
     let owner = ToolCallOwnerId::new();
 
     let response = caching
-        .cache(owner, "bash", &serde_json::json!({}), upstream)
+        .cache(
+            owner,
+            "bash",
+            &serde_json::json!({}),
+            upstream,
+            ToolOutputShape::Generic,
+        )
         .await
         .expect("persist must succeed");
 
@@ -242,6 +258,9 @@ async fn persisted_invocation_round_trips_through_find_by_id() {
 async fn persist_mode_emits_verbatim_t_without_elided_block() {
     let config = ToolCachingConfig {
         generic_threshold_bytes: 512,
+        // Disable the floor — this test needs the payload to actually
+        // elide so it hits the persist path.
+        min_hidden_bytes: 0,
         ..ToolCachingConfig::default()
     };
     let caching = ToolCaching::new(&pool().await, config);
@@ -258,6 +277,7 @@ async fn persist_mode_emits_verbatim_t_without_elided_block() {
             "bash",
             &serde_json::json!({}),
             upstream,
+            ToolOutputShape::Generic,
         )
         .await
         .expect("persistence must succeed");
@@ -283,6 +303,9 @@ async fn persist_mode_emits_verbatim_t_without_elided_block() {
 async fn direct_and_compose_persistence_share_fetch_root_but_not_wire_wrapper() {
     let config = ToolCachingConfig {
         generic_threshold_bytes: 512,
+        // Disable the floor — this test needs both paths to actually
+        // persist so it can round-trip a fetch afterwards.
+        min_hidden_bytes: 0,
         ..ToolCachingConfig::default()
     };
     let caching = ToolCaching::new(&pool().await, config);
@@ -294,11 +317,23 @@ async fn direct_and_compose_persistence_share_fetch_root_but_not_wire_wrapper() 
     upstream.structured_content = Some(upstream_t.clone());
 
     let direct = caching
-        .cache(owner, "contract", &serde_json::json!({}), upstream.clone())
+        .cache(
+            owner,
+            "contract",
+            &serde_json::json!({}),
+            upstream.clone(),
+            ToolOutputShape::Generic,
+        )
         .await
         .expect("direct cache succeeds");
     let compose = caching
-        .persist_for_compose(owner, "contract", &serde_json::json!({}), upstream)
+        .persist_for_compose(
+            owner,
+            "contract",
+            &serde_json::json!({}),
+            upstream,
+            ToolOutputShape::Generic,
+        )
         .await
         .expect("compose persist succeeds");
 
@@ -341,6 +376,92 @@ async fn direct_and_compose_persistence_share_fetch_root_but_not_wire_wrapper() 
     );
 }
 
+/// The min-hidden-bytes floor through the real `cache()` path (not just
+/// `Walker::summarize`): a payload that clears `generic_threshold_bytes`
+/// but would hide only a few KB must not elide, must not emit an
+/// envelope, and — since `ToolCaching::process` treats empty
+/// `elided_paths` as "don't persist" — must not write a
+/// `tool_invocations` row.
+#[tokio::test]
+async fn sub_floor_payload_yields_no_envelope_and_no_persistence() {
+    let config = ToolCachingConfig {
+        generic_threshold_bytes: 512,
+        // Default `min_hidden_bytes` (32 KB) is exactly what's under test.
+        ..ToolCachingConfig::default()
+    };
+    let caching = ToolCaching::new(&pool().await, config);
+
+    // 10 KB over a 512-byte threshold hides ~9.5 KB — comfortably under
+    // the default 32 KB floor.
+    let payload = "x".repeat(10_000);
+    let upstream = CallToolResult::success(vec![Content::text(payload.clone())]);
+
+    let response = caching
+        .cache(
+            ToolCallOwnerId::new(),
+            "bash",
+            &serde_json::json!({}),
+            upstream,
+            ToolOutputShape::Generic,
+        )
+        .await
+        .expect("sub-floor passthrough must not error");
+
+    assert!(
+        response.elided_paths.is_empty(),
+        "sub-floor payload must not elide"
+    );
+    assert!(
+        response.invocation_id.is_none(),
+        "empty elided_paths must not persist a tool_invocations row"
+    );
+    let text = envelope_text(&response.result);
+    assert_eq!(text, payload, "full payload should pass through verbatim");
+    assert!(!text.contains("<summary"));
+    assert!(!text.contains("<recovery"));
+}
+
+/// The same payload the floor suppresses above still elides when the
+/// calling tool declares itself log-shaped — a caller reads the tail of
+/// a log and rarely recovers the rest, so summarising wins at any size.
+/// This is the whole point of the declaration: without it, a small
+/// `pods_log` or build-log call would dump in full.
+#[tokio::test]
+async fn log_shaped_tool_elides_the_same_sub_floor_payload() {
+    let config = ToolCachingConfig {
+        generic_threshold_bytes: 512,
+        ..ToolCachingConfig::default()
+    };
+    let caching = ToolCaching::new(&pool().await, config);
+
+    let payload = "x".repeat(10_000);
+    let upstream = CallToolResult::success(vec![Content::text(payload.clone())]);
+
+    let response = caching
+        .cache(
+            ToolCallOwnerId::new(),
+            "k8s_pods_log",
+            &serde_json::json!({}),
+            upstream,
+            ToolOutputShape::Log,
+        )
+        .await
+        .expect("log-shaped elision must not error");
+
+    assert_eq!(
+        response.elided_paths.len(),
+        1,
+        "a log-shaped tool elides below the floor"
+    );
+    assert!(
+        response.invocation_id.is_some(),
+        "and persists for recovery"
+    );
+    let text = envelope_text(&response.result);
+    assert!(text.contains("<summary"), "got: {text}");
+    assert!(text.contains("<recovery"), "got: {text}");
+}
+
 #[tokio::test]
 async fn no_owner_is_passthrough() {
     let caching = ToolCaching::new(&pool().await, ToolCachingConfig::default());
@@ -349,7 +470,13 @@ async fn no_owner_is_passthrough() {
     let upstream = CallToolResult::success(vec![Content::text(big.clone())]);
 
     let response = caching
-        .cache(None, "bash", &serde_json::json!({}), upstream)
+        .cache(
+            None,
+            "bash",
+            &serde_json::json!({}),
+            upstream,
+            ToolOutputShape::Generic,
+        )
         .await
         .expect("no-owner path must not error");
 

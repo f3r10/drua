@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use serde_json::Value;
 
-use crate::config::ToolCachingConfig;
+use crate::config::{ElisionBudget, ToolCachingConfig};
 use crate::fetch::{
     ceil_char_boundary, fetch_text_size_at_path, floor_char_boundary,
     resolve_utf8_byte_window_usize as resolve_utf8_byte_window,
@@ -28,12 +28,14 @@ struct WalkCtx<'a> {
     primary_raw_string: Option<&'a str>,
     /// Mirror of the preprocessor's `prefer_tail`; only honored at `primary_path`.
     primary_prefer_tail: bool,
+    /// Budget for the array-truncation shrink loop, derived once from
+    /// this call's threshold so `truncate_array` doesn't need the walker.
+    sentinel_budget: usize,
 }
 
 #[derive(Clone)]
 pub struct Walker {
     chain: Arc<StringSummarizerChain>,
-    threshold_bytes: usize,
     sentinel_min_bytes: usize,
     sentinel_hard_cap_bytes: usize,
     max_fetch_response_bytes: usize,
@@ -43,23 +45,25 @@ impl Walker {
     pub fn new(chain: Arc<StringSummarizerChain>, config: &ToolCachingConfig) -> Self {
         Self {
             chain,
-            threshold_bytes: config.generic_threshold_bytes,
             sentinel_min_bytes: config.sentinel_min_bytes,
             sentinel_hard_cap_bytes: config.sentinel_hard_cap_bytes,
             max_fetch_response_bytes: config.max_fetch_response_bytes,
         }
     }
 
-    fn sentinel_budget(&self) -> usize {
-        self.threshold_bytes
-            .clamp(self.sentinel_min_bytes, self.sentinel_hard_cap_bytes)
+    fn sentinel_budget(&self, threshold_bytes: usize) -> usize {
+        threshold_bytes.clamp(self.sentinel_min_bytes, self.sentinel_hard_cap_bytes)
     }
 
+    /// `budget` is resolved per call by [`ToolCachingConfig::budget_for`]
+    /// from the calling tool's declared shape plus operator config — the
+    /// walker applies it and never decides anything per tool itself.
     pub fn summarize(
         &self,
         query_structure: &QueryStructure,
         invocation_id: ToolInvocationId,
         tool_name: &str,
+        budget: ElisionBudget,
     ) -> ToolCallSummary {
         // Preprocessor (if registered for this tool) owns its shape: it
         // returns a transformed root with text in-place cleaned, plus
@@ -93,11 +97,12 @@ impl Walker {
             primary_raw_bytes,
             primary_raw_string,
             primary_prefer_tail,
+            sentinel_budget: self.sentinel_budget(budget.threshold_bytes),
         };
         let wire_result = self.walk(
             root_for_walk,
             "$",
-            self.threshold_bytes,
+            budget.threshold_bytes,
             &ctx,
             &mut elided_paths,
         );
@@ -117,6 +122,36 @@ impl Walker {
             navigate_path(&query_structure.root, primary_path).unwrap_or(&query_structure.root);
         let total_bytes = byte_size(raw_at_primary);
         let shown_bytes = byte_size(&summary);
+
+        // Floor: hiding fewer than `min_hidden_bytes` costs more (one
+        // `tool_output_fetch` round trip, worth ~100 KB of context) than
+        // it saves, so pass the whole value through instead. Root totals,
+        // not a sum over `elided_paths` — nested paths would double-count.
+        //
+        // Preprocessed payloads never take this branch whatever the
+        // budget says: the bypass hands back `query_structure.root`, which
+        // for a log tool is the raw text with the ANSI escapes and
+        // timestamps the preprocessor just stripped. Swapping a small
+        // cleaned summary for a bigger dirty one is never the right
+        // trade, so the guard belongs here rather than in the budget.
+        if preprocessed.is_none()
+            && total_bytes.saturating_sub(shown_bytes) < budget.min_hidden_bytes as u64
+        {
+            let root = query_structure.root.clone();
+            return ToolCallSummary {
+                summary: root.clone(),
+                wire_result: root,
+                elided_paths: Vec::new(),
+                root_path: "$".to_string(),
+                total_bytes,
+                shown_bytes: total_bytes,
+                total_items: None,
+                shown_items: None,
+                total_lines: None,
+                shown_lines: None,
+                envelope_mode: false,
+            };
+        }
 
         let (total_items, shown_items) = match (raw_at_primary, &summary) {
             (Value::Array(orig), Value::Array(walked)) => {
@@ -225,7 +260,7 @@ impl Walker {
             n,
             original_bytes,
             path,
-            ctx.invocation_id,
+            ctx,
             paths_before,
             elided_paths,
         )
@@ -403,7 +438,7 @@ impl Walker {
         original_length: usize,
         original_bytes: u64,
         path: &str,
-        invocation_id: ToolInvocationId,
+        ctx: &WalkCtx,
         paths_before: usize,
         elided_paths: &mut Vec<ElidedPath>,
     ) -> Value {
@@ -412,7 +447,8 @@ impl Walker {
         // agent can slice `[K..N)` via `tool_output_fetch` if they need
         // more. Head+tail would be ambiguous on the wire — without a
         // delimiter the agent can't tell where the gap lives.
-        let budget = self.sentinel_budget();
+        let invocation_id = ctx.invocation_id;
+        let budget = ctx.sentinel_budget;
         let n = walked.len();
         let mut head_count = n.saturating_sub(1);
         let mut truncated = make_truncated_array(walked, head_count);
@@ -1097,12 +1133,30 @@ mod tests {
     fn walker_with_fetch_cap(max_fetch: usize) -> Walker {
         let config = ToolCachingConfig {
             // Force array-truncation by making the array budget small.
-            generic_threshold_bytes: 512,
             sentinel_min_bytes: 512,
             sentinel_hard_cap_bytes: 1024,
             max_fetch_response_bytes: max_fetch,
+            ..ToolCachingConfig::default()
         };
         Walker::new(Arc::new(StringSummarizerChain::new()), &config)
+    }
+
+    /// Elide at `threshold_bytes`, never trip the floor — what most of
+    /// these tests want, since they exercise elision mechanics rather
+    /// than the floor. Floor tests build their own budget.
+    fn budget(threshold_bytes: usize) -> ElisionBudget {
+        ElisionBudget {
+            threshold_bytes,
+            min_hidden_bytes: 0,
+        }
+    }
+
+    /// Production-shaped budget: 8 KB elision threshold, 32 KB floor.
+    fn floor_budget() -> ElisionBudget {
+        ElisionBudget {
+            threshold_bytes: 8192,
+            min_hidden_bytes: 32 * 1024,
+        }
     }
 
     /// Object of `n_fields` numeric fields — exceeds the array budget
@@ -1128,7 +1182,7 @@ mod tests {
             root: Value::Array(items),
         };
         let walker = walker_with_fetch_cap(1024);
-        let summary = walker.summarize(&qs, ToolInvocationId::new(), "test_tool");
+        let summary = walker.summarize(&qs, ToolInvocationId::new(), "test_tool", budget(512));
 
         // Find the aggregate `$` elided path (the truncation marker).
         let agg = summary
@@ -1182,7 +1236,7 @@ mod tests {
             root: Value::Array(items),
         };
         let walker = walker_with_fetch_cap(1024);
-        let summary = walker.summarize(&qs, ToolInvocationId::new(), "test_tool");
+        let summary = walker.summarize(&qs, ToolInvocationId::new(), "test_tool", budget(512));
 
         let agg = summary
             .elided_paths
@@ -1255,7 +1309,7 @@ mod tests {
             root: Value::Array(items),
         };
         let walker = walker_with_fetch_cap(16 * 1024);
-        let summary = walker.summarize(&qs, ToolInvocationId::new(), "test_tool");
+        let summary = walker.summarize(&qs, ToolInvocationId::new(), "test_tool", budget(512));
 
         let agg = summary
             .elided_paths
@@ -1297,6 +1351,10 @@ mod tests {
             sentinel_min_bytes: 200,
             sentinel_hard_cap_bytes: 200,
             max_fetch_response_bytes: 16 * 1024,
+            // These tests exercise head/tail line-split bias, not the
+            // floor — disable it so small fixtures still elide as before.
+            min_hidden_bytes: 0,
+            ..ToolCachingConfig::default()
         };
         Walker::new(Arc::new(StringSummarizerChain::new()), &config)
     }
@@ -1318,7 +1376,12 @@ mod tests {
             root: serde_json::json!({ "logs": logs }),
         };
         let walker = walker_for_line_split();
-        let summary = walker.summarize(&qs, ToolInvocationId::new(), "concourse-build-log");
+        let summary = walker.summarize(
+            &qs,
+            ToolInvocationId::new(),
+            "concourse-build-log",
+            budget(200),
+        );
         let body = summary.summary.as_str().expect("logs summary is string");
         let head_count = body
             .lines()
@@ -1355,7 +1418,7 @@ mod tests {
             root: Value::String(logs),
         };
         let walker = walker_for_line_split();
-        let summary = walker.summarize(&qs, ToolInvocationId::new(), "unknown_tool");
+        let summary = walker.summarize(&qs, ToolInvocationId::new(), "unknown_tool", budget(200));
         let body = summary.summary.as_str().expect("summary is string");
         let head_count = body
             .lines()
@@ -1377,6 +1440,115 @@ mod tests {
         assert!(
             diff <= 1,
             "generic split should be ~symmetric; got head={head_count}, tail={tail_count}"
+        );
+    }
+
+    // ── minimum-hidden-bytes floor ──
+
+    /// Payload over the elision threshold that would hide fewer than
+    /// `min_hidden_bytes`: the floor disarms elision and passes the whole
+    /// value through unmodified.
+    #[test]
+    fn sub_floor_payload_is_not_elided() {
+        // 10 KB over an 8 KB threshold hides ~1.8 KB — well under the
+        // 32 KB floor.
+        let s = "x".repeat(10_000);
+        let qs = QueryStructure {
+            root: Value::String(s.clone()),
+        };
+        let walker = Walker::new(
+            Arc::new(StringSummarizerChain::new()),
+            &ToolCachingConfig::default(),
+        );
+        let summary = walker.summarize(&qs, ToolInvocationId::new(), "test_tool", floor_budget());
+
+        assert!(
+            summary.elided_paths.is_empty(),
+            "sub-floor payload must not elide; got {:?}",
+            summary.elided_paths
+        );
+        assert_eq!(summary.wire_result, Value::String(s.clone()));
+        assert_eq!(summary.summary, Value::String(s));
+    }
+
+    /// Payload that hides more than `min_hidden_bytes` still elides — the
+    /// floor only suppresses the degenerate small-hide case.
+    #[test]
+    fn over_floor_payload_still_elides() {
+        // 200 KB over an 8 KB threshold hides ~192 KB.
+        let s = "x".repeat(200_000);
+        let qs = QueryStructure {
+            root: Value::String(s),
+        };
+        let walker = Walker::new(
+            Arc::new(StringSummarizerChain::new()),
+            &ToolCachingConfig::default(),
+        );
+        let summary = walker.summarize(&qs, ToolInvocationId::new(), "test_tool", floor_budget());
+
+        assert!(
+            !summary.elided_paths.is_empty(),
+            "over-floor payload must still elide"
+        );
+        assert!(summary.shown_bytes < summary.total_bytes);
+    }
+
+    /// A zero floor (what a `Log`-shaped tool resolves to) elides at any
+    /// size — the case that keeps log tools summarised no matter how
+    /// small an individual log happens to be.
+    #[test]
+    fn zero_floor_elides_a_small_payload() {
+        let s = "x".repeat(10_000);
+        let qs = QueryStructure {
+            root: Value::String(s),
+        };
+        let walker = Walker::new(
+            Arc::new(StringSummarizerChain::new()),
+            &ToolCachingConfig::default(),
+        );
+        let summary = walker.summarize(&qs, ToolInvocationId::new(), "test_tool", budget(8192));
+
+        assert!(
+            !summary.elided_paths.is_empty(),
+            "a zero floor must not suppress elision"
+        );
+        assert!(summary.shown_bytes < summary.total_bytes);
+    }
+
+    /// A preprocessed payload ignores the floor whatever the budget says.
+    /// The bypass returns the *raw* root, so taking it here would hand
+    /// back the ANSI escapes and timestamps the preprocessor just
+    /// stripped — bigger *and* dirtier than the elided summary.
+    #[test]
+    fn preprocessed_payload_ignores_the_floor() {
+        // ~3,000 short numbered lines ≈ 27 KB raw: over the 8 KB
+        // threshold, but hiding well under the 32 KB floor.
+        let logs = numbered_lines(3_000);
+        let qs = QueryStructure {
+            root: serde_json::json!({ "logs": logs }),
+        };
+        let walker = Walker::new(
+            Arc::new(StringSummarizerChain::new()),
+            &ToolCachingConfig::default(),
+        );
+        let budget = floor_budget();
+        let summary = walker.summarize(&qs, ToolInvocationId::new(), "concourse-build-log", budget);
+
+        let hidden = summary.total_bytes.saturating_sub(summary.shown_bytes);
+        assert!(
+            hidden < budget.min_hidden_bytes as u64,
+            "fixture should be sized under the floor by construction; hidden={hidden}"
+        );
+        assert!(
+            !summary.elided_paths.is_empty(),
+            "a preprocessed payload must still elide under the floor"
+        );
+        assert!(
+            summary
+                .summary
+                .as_str()
+                .is_some_and(|s| s.contains("<bulk-elided")),
+            "summary should show the cleaned, elided view, not the raw root"
         );
     }
 
@@ -1471,9 +1643,13 @@ mod tests {
             other => other,
         };
         let chain = Arc::new(crate::summarizer_passes::default_chain());
-        let walker = Walker::new(chain, &crate::config::ToolCachingConfig::default());
+        let config = crate::config::ToolCachingConfig::default();
+        let walker = Walker::new(chain, &config);
         let qs = QueryStructure { root };
-        let summary = walker.summarize(&qs, ToolInvocationId::new(), tool_name);
+        // Fake-upstream fixtures declare no shape, matching what the bats
+        // gateway resolves for them.
+        let budget = config.budget_for(tool_name, crate::config::ToolOutputShape::Generic);
+        let summary = walker.summarize(&qs, ToolInvocationId::new(), tool_name, budget);
         let envelope = summary.build_envelope_text();
         let uuid_re = regex::Regex::new(
             r#"invocation_id="[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}""#,
