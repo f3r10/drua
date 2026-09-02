@@ -100,6 +100,11 @@ impl TopLevelTool for ComposeTool {
          Use `return` for the final value. Top-level `await` and `Promise.all()` are supported. \
          **Call `compose_types` first** to fetch exact tool signatures and parameter names \
          — guessing leads to runtime errors that waste a round trip. \
+         **Reduce before you return.** The script reads full upstream payloads for free, \
+         but the value you `return` is elided against the same ~8 KB budget as any tool \
+         result — return the fields and rows you actually need, not whole responses, or \
+         the agent spends `tool_output_fetch` round trips reading back what the script \
+         already had in hand. \
          Scope is plain JavaScript plus `tools`, `console`, and `setTimeout` — \
          no Node.js builtins (`require`, `module`, `process`, `fs` are unavailable).\n\n\
          Example:\n```js\nconst envs = await tools.honeycomb.list_environments({});\n\
