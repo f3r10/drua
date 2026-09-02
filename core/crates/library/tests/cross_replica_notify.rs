@@ -50,8 +50,8 @@ async fn init_replica(
 
 #[tokio::test]
 #[ignore = "requires postgres + writes to tests/.library; run with --ignored"]
-async fn write_on_one_replica_is_visible_on_peer_without_ticker() {
-    let test_name = "write_on_one_replica_is_visible_on_peer_without_ticker";
+async fn write_on_one_replica_is_visible_on_peer_without_ticker_eventual_consistency() {
+    let test_name = "write_on_one_replica_is_visible_on_peer_without_ticker_eventual_consistency";
     let _ = tracing_subscriber::fmt()
         .with_env_filter("drua_library=debug,info")
         .try_init();
@@ -95,4 +95,51 @@ async fn write_on_one_replica_is_visible_on_peer_without_ticker() {
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+}
+
+#[tokio::test]
+#[ignore = "requires postgres + writes to tests/.library; run with --ignored"]
+async fn write_on_one_replica_is_visible_on_peer_without_ticker() {
+    let test_name = "write_on_one_replica_is_visible_on_peer_without_ticker";
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("drua_library=debug,info")
+        .try_init();
+    let fixture = TestRepo::init(&[("README.md", "init\n")]);
+    let pool = pool().await;
+    reset_library_db_state(&pool).await;
+
+    // Only replica A polls jobs, so A is guaranteed to execute the
+    // library.write job; B has no poller and a disabled ticker, so it
+    // can only converge via the `library_head_changed` PG NOTIFY.
+    let repo_url = fixture.path().to_string_lossy().to_string();
+    let (replica_a, _jobs_a) = init_replica(test_name, "a", &repo_url, &pool, true).await;
+    let (replica_b, _jobs_b) = init_replica(test_name, "b", &repo_url, &pool, false).await;
+
+    let slug = "notify";
+    replica_a
+        .spaces()
+        .create(slug.into(), None, CommitAttribution::library_default())
+        .await
+        .expect("create space");
+    replica_a
+        .spaces()
+        .write_file(
+            slug,
+            "doc.md",
+            "alpha bravo\n".into(),
+            CommitAttribution::library_default(),
+        )
+        .await
+        .expect("write");
+
+    let path = format!("spaces/{slug}/doc.md");
+    let content = replica_b
+        .read_blob_at_head(&path)
+        .await
+        .expect("read on replica B");
+    assert_eq!(
+        content.as_deref(),
+        Some(b"alpha bravo\n".as_slice()),
+        "read-your-write violated"
+    );
 }
