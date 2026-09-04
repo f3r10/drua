@@ -2,7 +2,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use sqlx::{PgConnection, PgPool};
+use obix::out::Outbox;
+use obix::EventSequence;
+use serde::{Deserialize, Serialize};
+
+use sqlx::PgPool;
+use std::sync::RwLock;
 use tokio::sync::{mpsc, oneshot, Mutex, Notify};
 use tokio::task::JoinHandle;
 
@@ -111,6 +116,12 @@ struct QueuedOp {
 /// Drop aborts the worker; lets it live as long as its owning `GitEngine`.
 struct OwnedTaskHandle(Option<JoinHandle<()>>);
 
+// obix::OutboxEvent
+#[derive(Serialize, Deserialize, Clone)]
+pub(crate) struct LibraryHeadChanged {
+    head: String,
+}
+
 impl OwnedTaskHandle {
     fn new(inner: JoinHandle<()>) -> Self {
         Self(Some(inner))
@@ -138,6 +149,11 @@ pub struct GitEngine {
     github_app: Option<Arc<GitHubAppTokenProvider>>,
     _writer: OwnedTaskHandle,
     _listener: OwnedTaskHandle,
+    outbox: Outbox<LibraryHeadChanged>,
+    /// Highest outbox sequence this replica's clone is known to reflect.
+    /// Compared against the authoritative frontier to decide whether a
+    /// read must catch up first.
+    local_known_sequence: Arc<RwLock<EventSequence>>,
 }
 
 impl GitEngine {
@@ -152,11 +168,12 @@ impl GitEngine {
     }
 
     #[tracing::instrument(name = "library.git.init", skip_all)]
-    pub async fn init(
+    pub(crate) async fn init(
         repo_url: &str,
         repo_path: PathBuf,
         github_app: Option<Arc<GitHubAppTokenProvider>>,
         pool: PgPool,
+        outbox: Outbox<LibraryHeadChanged>,
     ) -> Result<Self, LibraryError> {
         if repo_url.is_empty() {
             return Err(LibraryError::Config("repo_url is empty".into()));
@@ -174,6 +191,7 @@ impl GitEngine {
         let repo_mutex = Arc::new(Mutex::new(()));
         let (write_tx, write_rx) = mpsc::channel(QUEUE_CAPACITY);
         let commit_notify = Arc::new(Notify::new());
+
         let writer = tokio::spawn(Self::run_writer(
             repo_path.clone(),
             github_app.clone(),
@@ -181,6 +199,7 @@ impl GitEngine {
             Arc::clone(&commit_notify),
             write_rx,
             pool.clone(),
+            outbox.clone(),
         ));
         let listener = tokio::spawn(Self::run_head_listener(pool, Arc::clone(&commit_notify)));
 
@@ -192,7 +211,32 @@ impl GitEngine {
             github_app,
             _writer: OwnedTaskHandle::new(writer),
             _listener: OwnedTaskHandle::new(listener),
+            outbox,
+            local_known_sequence: Arc::new(RwLock::new(EventSequence::BEGIN)),
         })
+    }
+
+    /// Publishes the post-push head as a persistent event.
+    async fn publish_head(
+        outbox: &Outbox<LibraryHeadChanged>,
+        head: String,
+    ) -> Result<(), sqlx::Error> {
+        let mut op = outbox.begin_op().await?;
+        outbox
+            .publish_persisted_in_op(&mut op, LibraryHeadChanged { head })
+            .await?;
+        op.commit().await?;
+        Ok(())
+    }
+
+    async fn ensure_caught_up(&self) -> Result<(), LibraryError> {
+        let frontier = self.outbox.highest_known_persistent_sequence().await?;
+        if frontier <= *self.local_known_sequence.read().unwrap() {
+            return Ok(());
+        }
+        self.fetch_and_head().await?;
+        *self.local_known_sequence.write().unwrap() = frontier;
+        Ok(())
     }
 
     /// Cluster-wide counterpart of the writer's local wake-up: any
@@ -440,6 +484,7 @@ impl GitEngine {
     /// path doesn't exist (or HEAD is unborn).
     #[tracing::instrument(name = "library.git.read_blob_at_head", skip_all, fields(%path))]
     pub async fn read_blob_at_head(&self, path: &str) -> Result<Option<Vec<u8>>, LibraryError> {
+        self.ensure_caught_up().await?;
         let repo_path = self.repo_path.clone();
         let path = path.to_string();
         tokio::task::spawn_blocking(move || -> Result<Option<Vec<u8>>, LibraryError> {
@@ -738,6 +783,7 @@ impl GitEngine {
         commit_notify: Arc<Notify>,
         mut rx: mpsc::Receiver<QueuedOp>,
         pool: PgPool,
+        outbox: Outbox<LibraryHeadChanged>,
     ) {
         while let Some(first) = rx.recv().await {
             let mut batch = vec![first];
@@ -754,9 +800,15 @@ impl GitEngine {
                     Err(_) => break,    // window elapsed
                 }
             }
-            let any_ok =
-                Self::process_batch(&repo_path, github_app.as_ref(), &repo_mutex, &pool, batch)
-                    .await;
+            let any_ok = Self::process_batch(
+                &repo_path,
+                github_app.as_ref(),
+                &repo_mutex,
+                &pool,
+                batch,
+                outbox.clone(),
+            )
+            .await;
             if any_ok {
                 commit_notify.notify_one();
             }
@@ -770,6 +822,7 @@ impl GitEngine {
         repo_mutex: &Mutex<()>,
         pool: &PgPool,
         batch: Vec<QueuedOp>,
+        outbox: Outbox<LibraryHeadChanged>,
     ) -> bool {
         let _guard = repo_mutex.lock().await;
         // Cluster-wide push serialization (HA): the per-pod `repo_mutex` only
@@ -806,20 +859,27 @@ impl GitEngine {
         let (ops, responders): (Vec<BatchOp>, Vec<oneshot::Sender<Result<(), LibraryError>>>) =
             batch.into_iter().map(|q| (q.op, q.response)).unzip();
 
-        let results = tokio::task::spawn_blocking(move || -> Vec<Result<(), LibraryError>> {
-            Self::commit_each_then_push_blocking(&path, ops, token.as_deref())
-        })
+        let (results, head) = tokio::task::spawn_blocking(
+            move || -> (Vec<Result<(), LibraryError>>, Option<String>) {
+                Self::commit_each_then_push_blocking(&path, ops, token.as_deref())
+            },
+        )
         .await
         .unwrap_or_else(|e| {
             let msg = format!("commit_each_then_push join: {e}");
-            (0..n)
-                .map(|_| Err(LibraryError::Git(msg.clone())))
-                .collect()
+            (
+                (0..n)
+                    .map(|_| Err(LibraryError::Git(msg.clone())))
+                    .collect(),
+                None,
+            )
         });
 
         let any_ok = results.iter().any(|r| r.is_ok());
-        if any_ok {
-            Self::notify_cluster_push(pool, lock_conn.as_deref_mut()).await;
+        if let Some(head) = head {
+            if let Err(e) = Self::publish_head(&outbox, head).await {
+                tracing::warn!(error = %e, "library head publish failed; peers converge on ticker");
+            }
         }
 
         if let Some(mut conn) = lock_conn.take() {
@@ -837,29 +897,6 @@ impl GitEngine {
         any_ok
     }
 
-    /// Wake peer replicas' fetchers after a successful push so
-    /// cross-replica reads converge in milliseconds instead of after
-    /// each replica's fetch ticker. Best effort: failure degrades to
-    /// ticker-cadence convergence. Prefers the advisory-lock connection
-    /// (already held) over a fresh pool checkout.
-    async fn notify_cluster_push(pool: &PgPool, lock_conn: Option<&mut PgConnection>) {
-        let res = match lock_conn {
-            Some(conn) => sqlx::query("SELECT pg_notify($1, '')")
-                .bind(LIBRARY_HEAD_NOTIFY_CHANNEL)
-                .execute(conn)
-                .await
-                .map(|_| ()),
-            None => sqlx::query("SELECT pg_notify($1, '')")
-                .bind(LIBRARY_HEAD_NOTIFY_CHANNEL)
-                .execute(pool)
-                .await
-                .map(|_| ()),
-        };
-        if let Err(e) = res {
-            tracing::warn!(error = %e, "library head notify failed; peers converge on ticker");
-        }
-    }
-
     /// Apply N ops as N commits, then push once. On non-FF push, fetch
     /// origin, reset local main, and replay every op against the new
     /// HEAD; second push failure rolls local main back to the
@@ -871,18 +908,20 @@ impl GitEngine {
         repo_path: &Path,
         ops: Vec<BatchOp>,
         token: Option<&str>,
-    ) -> Vec<Result<(), LibraryError>> {
+    ) -> (Vec<Result<(), LibraryError>>, Option<String>) {
         if ops.is_empty() {
-            return Vec::new();
+            return (Vec::new(), None);
         }
         let repo = match git2::Repository::open_bare(repo_path) {
             Ok(r) => r,
             Err(e) => {
                 let msg = format!("open bare: {e}");
-                return ops
-                    .iter()
-                    .map(|_| Err(LibraryError::Git(msg.clone())))
-                    .collect();
+                return (
+                    ops.iter()
+                        .map(|_| Err(LibraryError::Git(msg.clone())))
+                        .collect(),
+                    None,
+                );
             }
         };
 
@@ -891,10 +930,12 @@ impl GitEngine {
             Ok(c) => c.id(),
             Err(e) => {
                 let msg = format!("head: {e}");
-                return ops
-                    .iter()
-                    .map(|_| Err(LibraryError::Git(msg.clone())))
-                    .collect();
+                return (
+                    ops.iter()
+                        .map(|_| Err(LibraryError::Git(msg.clone())))
+                        .collect(),
+                    None,
+                );
             }
         };
         let mut attempt: u32 = 0;
@@ -904,10 +945,12 @@ impl GitEngine {
                 Ok(c) => c.id(),
                 Err(e) => {
                     let msg = format!("head: {e}");
-                    return ops
-                        .iter()
-                        .map(|_| Err(LibraryError::Git(msg.clone())))
-                        .collect();
+                    return (
+                        ops.iter()
+                            .map(|_| Err(LibraryError::Git(msg.clone())))
+                            .collect(),
+                        None,
+                    );
                 }
             };
             let mut current_parent_oid = parent_oid_at_attempt_start;
@@ -924,11 +967,11 @@ impl GitEngine {
             }
 
             if current_parent_oid == parent_oid_at_attempt_start {
-                return per_op;
+                return (per_op, None);
             }
 
             match Self::push_main(&repo, token) {
-                Ok(()) => return per_op,
+                Ok(()) => return (per_op, Some(current_parent_oid.to_string())),
                 Err(e) if attempt < MAX_ATTEMPTS => {
                     tracing::info!(
                         error = %e, attempt,
@@ -936,17 +979,21 @@ impl GitEngine {
                     );
                     if let Err(fe) = Self::fetch_origin(&repo, token) {
                         let msg = fe.to_string();
-                        return ops
-                            .iter()
-                            .map(|_| Err(LibraryError::Git(msg.clone())))
-                            .collect();
+                        return (
+                            ops.iter()
+                                .map(|_| Err(LibraryError::Git(msg.clone())))
+                                .collect(),
+                            None,
+                        );
                     }
                     if let Err(re) = Self::reset_main_to_origin(&repo) {
                         let msg = re.to_string();
-                        return ops
-                            .iter()
-                            .map(|_| Err(LibraryError::Git(msg.clone())))
-                            .collect();
+                        return (
+                            ops.iter()
+                                .map(|_| Err(LibraryError::Git(msg.clone())))
+                                .collect(),
+                            None,
+                        );
                     }
                 }
                 Err(e) => {
@@ -957,13 +1004,16 @@ impl GitEngine {
                         "rollback after push failure",
                     );
                     let msg = format!("push failed: {e}");
-                    return per_op
-                        .into_iter()
-                        .map(|r| match r {
-                            Ok(()) => Err(LibraryError::Git(msg.clone())),
-                            Err(e) => Err(e),
-                        })
-                        .collect();
+                    return (
+                        per_op
+                            .into_iter()
+                            .map(|r| match r {
+                                Ok(()) => Err(LibraryError::Git(msg.clone())),
+                                Err(e) => Err(e),
+                            })
+                            .collect(),
+                        None,
+                    );
                 }
             }
         }

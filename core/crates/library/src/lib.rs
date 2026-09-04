@@ -15,6 +15,10 @@ use std::time::Duration;
 
 use tokio::sync::mpsc;
 
+use crate::git::LibraryHeadChanged;
+use futures::stream::StreamExt;
+use obix::{out::Outbox, MailboxConfig};
+
 pub use attribution::{CommitAttribution, CommitSubjectKind};
 pub use config::LibraryConfig;
 pub use error::LibraryError;
@@ -62,12 +66,21 @@ impl Library {
         github_app: Option<Arc<GitHubAppTokenProvider>>,
     ) -> Result<Self, LibraryError> {
         let repo_path = PathBuf::from(&config.data_dir);
+        // Initialize outbox (uses default tables from migration)
+        let outbox: Outbox<LibraryHeadChanged> = Outbox::<LibraryHeadChanged>::init(
+            &pool,
+            MailboxConfig::builder()
+                .build()
+                .expect("Couldn't build MailboxConfig"),
+        )
+        .await?;
         let git = Arc::new(
             GitEngine::init(
                 &config.repo_url,
                 repo_path,
                 github_app.clone(),
                 pool.clone(),
+                outbox.clone(),
             )
             .await?,
         );
@@ -99,7 +112,7 @@ impl Library {
             Arc::clone(&git),
             tick_tx,
             Duration::from_millis(config.fetch_interval_ms),
-            git.commit_notify(),
+            outbox,
         );
 
         let spawner = jobs.add_resident_initializer(LibrarySyncJobInitializer::new(
@@ -146,16 +159,17 @@ impl Library {
         git: Arc<GitEngine>,
         tick_tx: mpsc::Sender<CommitTick>,
         interval: Duration,
-        commit_notify: Arc<tokio::sync::Notify>,
+        outbox: Outbox<LibraryHeadChanged>,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(interval);
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             let mut last_head: Option<String> = None;
+            let mut head_listener = outbox.listen_persisted(None);
             loop {
                 tokio::select! {
                     _ = ticker.tick() => {}
-                    _ = commit_notify.notified() => {}
+                    _ = head_listener.next() => {}
                 }
                 match git.fetch_and_head().await {
                     Ok(Some(head)) => {
