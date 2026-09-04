@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use sqlx::PgPool;
 use std::sync::RwLock;
-use tokio::sync::{mpsc, oneshot, Mutex, Notify};
+use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::task::JoinHandle;
 
 use crate::attribution::CommitAttribution;
@@ -26,13 +26,6 @@ const QUEUE_CAPACITY: usize = 256;
 /// Cluster-wide Postgres advisory-lock key for serializing pushes to the
 /// library repo's `main`. Fixed (one library repo per deployment); `0x647275616c6962` = "drualib".
 const LIBRARY_PUSH_LOCK_KEY: i64 = 0x647275616c6962;
-
-/// PG NOTIFY channel fired after a successful push. Every replica's
-/// fetcher LISTENs on it, so a write on one replica is visible
-/// cluster-wide in milliseconds instead of after each replica's fetch
-/// ticker (`fetch_interval_ms`). Payload is empty; the wake-up is
-/// purely a hint, the ticker remains the backstop.
-const LIBRARY_HEAD_NOTIFY_CHANNEL: &str = "library_head_changed";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeltaKind {
@@ -143,12 +136,8 @@ pub struct GitEngine {
     /// in-flight commits before `push_main` lands.
     repo_mutex: Arc<Mutex<()>>,
     write_tx: mpsc::Sender<QueuedOp>,
-    /// Wakes the fetcher. Fired by the local writer after a successful
-    /// batch and by the head listener on any peer replica's push.
-    commit_notify: Arc<Notify>,
     github_app: Option<Arc<GitHubAppTokenProvider>>,
     _writer: OwnedTaskHandle,
-    _listener: OwnedTaskHandle,
     outbox: Outbox<LibraryHeadChanged>,
     /// Highest outbox sequence this replica's clone is known to reflect.
     /// Compared against the authoritative frontier to decide whether a
@@ -161,10 +150,6 @@ impl GitEngine {
     /// SpaceFs reads land.
     pub fn repo_path(&self) -> &Path {
         &self.repo_path
-    }
-
-    pub fn commit_notify(&self) -> Arc<Notify> {
-        Arc::clone(&self.commit_notify)
     }
 
     #[tracing::instrument(name = "library.git.init", skip_all)]
@@ -190,27 +175,21 @@ impl GitEngine {
 
         let repo_mutex = Arc::new(Mutex::new(()));
         let (write_tx, write_rx) = mpsc::channel(QUEUE_CAPACITY);
-        let commit_notify = Arc::new(Notify::new());
-
         let writer = tokio::spawn(Self::run_writer(
             repo_path.clone(),
             github_app.clone(),
             Arc::clone(&repo_mutex),
-            Arc::clone(&commit_notify),
             write_rx,
-            pool.clone(),
+            pool,
             outbox.clone(),
         ));
-        let listener = tokio::spawn(Self::run_head_listener(pool, Arc::clone(&commit_notify)));
 
         Ok(Self {
             repo_path,
             repo_mutex,
             write_tx,
-            commit_notify,
             github_app,
             _writer: OwnedTaskHandle::new(writer),
-            _listener: OwnedTaskHandle::new(listener),
             outbox,
             local_known_sequence: Arc::new(RwLock::new(EventSequence::BEGIN)),
         })
@@ -237,37 +216,6 @@ impl GitEngine {
         self.fetch_and_head().await?;
         *self.local_known_sequence.write().unwrap() = frontier;
         Ok(())
-    }
-
-    /// Cluster-wide counterpart of the writer's local wake-up: any
-    /// replica's successful push `pg_notify`s [`LIBRARY_HEAD_NOTIFY_CHANNEL`],
-    /// waking this replica's fetcher immediately. While PG is
-    /// unreachable, sync degrades to ticker cadence.
-    async fn run_head_listener(pool: PgPool, commit_notify: Arc<Notify>) {
-        loop {
-            let mut listener = match sqlx::postgres::PgListener::connect_with(&pool).await {
-                Ok(l) => l,
-                Err(e) => {
-                    tracing::warn!(error = %e, "library head listener: connect failed; retrying");
-                    tokio::time::sleep(Duration::from_secs(1)).await;
-                    continue;
-                }
-            };
-            if let Err(e) = listener.listen(LIBRARY_HEAD_NOTIFY_CHANNEL).await {
-                tracing::warn!(error = %e, "library head listener: LISTEN failed; retrying");
-                tokio::time::sleep(Duration::from_secs(1)).await;
-                continue;
-            }
-            loop {
-                match listener.recv().await {
-                    Ok(_) => commit_notify.notify_one(),
-                    Err(e) => {
-                        tracing::warn!(error = %e, "library head listener: recv failed; reconnecting");
-                        break;
-                    }
-                }
-            }
-        }
     }
 
     /// Diff between two commits (None `from` = walk all of `to`'s tree as Added)
@@ -780,7 +728,6 @@ impl GitEngine {
         repo_path: PathBuf,
         github_app: Option<Arc<GitHubAppTokenProvider>>,
         repo_mutex: Arc<Mutex<()>>,
-        commit_notify: Arc<Notify>,
         mut rx: mpsc::Receiver<QueuedOp>,
         pool: PgPool,
         outbox: Outbox<LibraryHeadChanged>,
@@ -800,7 +747,7 @@ impl GitEngine {
                     Err(_) => break,    // window elapsed
                 }
             }
-            let any_ok = Self::process_batch(
+            Self::process_batch(
                 &repo_path,
                 github_app.as_ref(),
                 &repo_mutex,
@@ -809,9 +756,6 @@ impl GitEngine {
                 outbox.clone(),
             )
             .await;
-            if any_ok {
-                commit_notify.notify_one();
-            }
         }
     }
 
@@ -823,7 +767,7 @@ impl GitEngine {
         pool: &PgPool,
         batch: Vec<QueuedOp>,
         outbox: Outbox<LibraryHeadChanged>,
-    ) -> bool {
+    ) {
         let _guard = repo_mutex.lock().await;
         // Cluster-wide push serialization (HA): the per-pod `repo_mutex` only
         // orders writes within a pod; this advisory lock ensures at most one
@@ -875,7 +819,6 @@ impl GitEngine {
             )
         });
 
-        let any_ok = results.iter().any(|r| r.is_ok());
         if let Some(head) = head {
             if let Err(e) = Self::publish_head(&outbox, head).await {
                 tracing::warn!(error = %e, "library head publish failed; peers converge on ticker");
@@ -894,7 +837,6 @@ impl GitEngine {
         for (resp, res) in responders.into_iter().zip(results) {
             let _ = resp.send(res);
         }
-        any_ok
     }
 
     /// Apply N ops as N commits, then push once. On non-FF push, fetch
