@@ -8,8 +8,8 @@ use drua_library::{CommitAttribution, Library, LibraryConfig};
 
 const PG_CON: &str = "postgres://user:password@localhost:5432/drua";
 
-/// Ticker effectively disabled: convergence can only come from the
-/// cross-replica `library_head_changed` PG NOTIFY wake-up.
+/// Ticker effectively disabled: background convergence can only come
+/// from the cross-replica obix head event, never a periodic fetch.
 const FETCH_INTERVAL_MS: u64 = 3_600_000;
 
 async fn pool() -> sqlx::PgPool {
@@ -61,7 +61,7 @@ async fn write_on_one_replica_is_visible_on_peer_without_ticker_eventual_consist
 
     // Only replica A polls jobs, so A is guaranteed to execute the
     // library.write job; B has no poller and a disabled ticker, so it
-    // can only converge via the `library_head_changed` PG NOTIFY.
+    // can only converge via the cross-replica obix head event.
     let repo_url = fixture.path().to_string_lossy().to_string();
     let (replica_a, _jobs_a) = init_replica(test_name, "a", &repo_url, &pool, true).await;
     let (replica_b, _jobs_b) = init_replica(test_name, "b", &repo_url, &pool, false).await;
@@ -109,8 +109,9 @@ async fn write_on_one_replica_is_visible_on_peer_without_ticker() {
     reset_library_db_state(&pool).await;
 
     // Only replica A polls jobs, so A is guaranteed to execute the
-    // library.write job; B has no poller and a disabled ticker, so it
-    // can only converge via the `library_head_changed` PG NOTIFY.
+    // library.write job. B has no poller and a disabled ticker, so it
+    // cannot converge in the background within this window — the read
+    // below has to catch B up itself, which is the whole point.
     let repo_url = fixture.path().to_string_lossy().to_string();
     let (replica_a, _jobs_a) = init_replica(test_name, "a", &repo_url, &pool, true).await;
     let (replica_b, _jobs_b) = init_replica(test_name, "b", &repo_url, &pool, false).await;
